@@ -1,124 +1,118 @@
-from datetime import datetime
+from datetime import timedelta
 
 from aiogram import types
 from aiogram.dispatcher import FSMContext
 
 from loader import dp
-from states import AddReminder, UpdateWeight, AddSteps, StudyAssistant
+from states import (
+    AddReminder,
+    HealthSetup,
+    UpdateWeight,
+    AddSteps,
+    AddDayPlan,
+    AddGoal,
+    RemoveGoal,
+    DailyPulse,
+    StudyExplain,
+    StudyTimer,
+    MentalChat,
+    PhysicalHealth,
+)
 from keyboards.default import (
     main_menu_keyboard,
     reminders_keyboard,
     health_keyboard,
+    day_keyboard,
     study_keyboard,
     support_keyboard,
     cancel_keyboard,
 )
 from utils.db import (
     get_user,
+    update_health_profile,
     update_weight,
     add_water,
     reset_water,
     add_steps,
+    award_daily_candy,
     create_reminder,
     get_user_reminders,
+    add_day_plan,
+    get_day_plans,
+    clear_day_plan,
+    add_goal,
+    get_goals,
+    remove_goal,
+    save_daily_pulse,
 )
-from utils.helpers import parse_reminder_time, format_profile
+from utils.helpers import (
+    parse_reminder_time,
+    format_profile,
+    normalize_body_type,
+    today_str,
+    local_now,
+    daily_pulse_answer,
+    mental_support_answer,
+    physical_health_answer,
+    study_explain,
+    generate_tasks,
+    STATUS_SHOP,
+)
 
 
-# Универсальная отмена
+async def _award(message: types.Message):
+    ok = await award_daily_candy(message.from_user.id, today_str())
+    if ok:
+        await message.answer('🍭 За активность сегодня ты получил 1 леденец!')
+
+
 @dp.message_handler(lambda message: message.text == '❌ Отмена', state='*')
 async def cancel_any_state(message: types.Message, state: FSMContext):
     await state.finish()
     await message.answer('❌ Действие отменено.', reply_markup=main_menu_keyboard())
 
 
-# Главное меню -> разделы
-@dp.message_handler(lambda message: message.text == '⏰ Напоминания', state='*')
-async def open_reminders(message: types.Message, state: FSMContext):
-    await state.finish()
-    await message.answer('Выбери действие в разделе напоминаний:', reply_markup=reminders_keyboard())
-
-
-@dp.message_handler(lambda message: message.text == '💧 Здоровье', state='*')
-async def open_health(message: types.Message, state: FSMContext):
-    await state.finish()
-    await message.answer('Раздел здоровья открыт:', reply_markup=health_keyboard())
-
-
-@dp.message_handler(lambda message: message.text == '📚 Учёба', state='*')
-async def open_study(message: types.Message, state: FSMContext):
-    await state.finish()
-    await message.answer('Раздел учёбы открыт:', reply_markup=study_keyboard())
-
-
-@dp.message_handler(lambda message: message.text == '🤝 Поддержка', state='*')
-async def open_support(message: types.Message, state: FSMContext):
-    await state.finish()
-    await message.answer('Я рядом. Выбери своё состояние:', reply_markup=support_keyboard())
-
-
+@dp.message_handler(commands=['menu'], state='*')
 @dp.message_handler(lambda message: message.text == '🔙 Назад', state='*')
 async def go_back(message: types.Message, state: FSMContext):
     await state.finish()
     await message.answer('Главное меню:', reply_markup=main_menu_keyboard())
 
 
-# Напоминания
-@dp.message_handler(lambda message: message.text == '📋 Мои напоминания', state='*')
-async def show_reminders(message: types.Message, state: FSMContext):
+@dp.message_handler(commands=['health'], state='*')
+@dp.message_handler(lambda message: message.text == '💧 Здоровье', state='*')
+async def open_health(message: types.Message, state: FSMContext):
     await state.finish()
-    reminders = await get_user_reminders(message.from_user.id)
-    if not reminders:
-        await message.answer('У тебя пока нет активных напоминаний.', reply_markup=reminders_keyboard())
-        return
-
-    lines = ['<b>Твои активные напоминания:</b>\n']
-    for idx, reminder in enumerate(reminders[:10], start=1):
-        remind_at = datetime.strptime(reminder['remind_at'], '%Y-%m-%d %H:%M:%S')
-        lines.append(f"{idx}. {reminder['text']} — <code>{remind_at.strftime('%d.%m %H:%M')}</code>")
-    await message.answer('\n'.join(lines), reply_markup=reminders_keyboard())
+    await message.answer('💧 Раздел здоровья:', reply_markup=health_keyboard())
+    await _award(message)
 
 
-@dp.message_handler(lambda message: message.text == '➕ Добавить', state='*')
-async def add_reminder_start(message: types.Message, state: FSMContext):
+@dp.message_handler(commands=['reminders'], state='*')
+@dp.message_handler(lambda message: message.text == '⏰ Напоминания', state='*')
+async def open_reminders(message: types.Message, state: FSMContext):
     await state.finish()
-    await AddReminder.waiting_for_text.set()
-    await message.answer('📝 Напиши текст напоминания.', reply_markup=cancel_keyboard())
+    await message.answer('⏰ Выбери действие:', reply_markup=reminders_keyboard())
+    await _award(message)
 
 
-@dp.message_handler(state=AddReminder.waiting_for_text)
-async def get_reminder_text(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if len(text) < 2:
-        await message.answer('Текст слишком короткий. Напиши напоминание подробнее.')
-        return
-    await state.update_data(reminder_text=text)
-    await AddReminder.next()
-    await message.answer('⏰ Теперь напиши время. Например: 18:30 или через 20 минут', reply_markup=cancel_keyboard())
-
-
-@dp.message_handler(state=AddReminder.waiting_for_time)
-async def get_reminder_time(message: types.Message, state: FSMContext):
-    parsed = parse_reminder_time(message.text)
-    if not parsed:
-        await message.answer('⚠️ Не понял время. Напиши, например: 18:30 или через 20 минут')
-        return
-
-    data = await state.get_data()
-    await create_reminder(
-        user_id=message.from_user.id,
-        text=data['reminder_text'],
-        remind_at=parsed.strftime('%Y-%m-%d %H:%M:%S')
-    )
+@dp.message_handler(commands=['day'], state='*')
+@dp.message_handler(lambda message: message.text == '📝 День и цели', state='*')
+async def open_day(message: types.Message, state: FSMContext):
     await state.finish()
-    await message.answer(
-        f"✅ Напоминание сохранено\n\n⏰ {parsed.strftime('%H:%M')}\n📝 {data['reminder_text']}",
-        reply_markup=reminders_keyboard()
-    )
+    await message.answer('📝 План на день очищается каждый новый день, а цели остаются пока ты их не удалишь.', reply_markup=day_keyboard())
+    await _award(message)
 
 
-# Здоровье
-@dp.message_handler(lambda message: message.text == '📊 Мой профиль', state='*')
+@dp.message_handler(commands=['study'], state='*')
+@dp.message_handler(lambda message: message.text == '📚 Учёба', state='*')
+async def open_study(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.answer('📚 Раздел учёбы:', reply_markup=study_keyboard())
+    await _award(message)
+
+
+@dp.message_handler(commands=['profile'], state='*')
+@dp.message_handler(lambda message: message.text in ['👤 Профиль', '📊 Мой профиль'], state='*')
 async def profile_show(message: types.Message, state: FSMContext):
     await state.finish()
     user = await get_user(message.from_user.id)
@@ -126,8 +120,109 @@ async def profile_show(message: types.Message, state: FSMContext):
         await message.answer('Сначала отправь /start')
         return
     await message.answer(format_profile(user), reply_markup=health_keyboard())
+    await _award(message)
 
 
+# ---------- Напоминания ----------
+@dp.message_handler(commands=['myreminders'], state='*')
+@dp.message_handler(lambda message: message.text == '📋 Мои напоминания', state='*')
+async def show_reminders(message: types.Message, state: FSMContext):
+    await state.finish()
+    reminders = await get_user_reminders(message.from_user.id)
+    if not reminders:
+        await message.answer('У тебя пока нет активных напоминаний.', reply_markup=reminders_keyboard())
+        return
+    lines = ['<b>Твои активные напоминания:</b>\n']
+    for idx, reminder in enumerate(reminders[:10], start=1):
+        lines.append(f"{idx}. {reminder['text']} — <code>{reminder['remind_at']}</code>")
+    await message.answer('\n'.join(lines), reply_markup=reminders_keyboard())
+
+
+@dp.message_handler(commands=['addreminder'], state='*')
+@dp.message_handler(lambda message: message.text == '➕ Добавить', state='*')
+async def add_reminder_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    await AddReminder.waiting_for_text.set()
+    await message.answer('📝 Напиши текст напоминания. Например: сделать математику', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=AddReminder.waiting_for_text)
+async def get_reminder_text(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if len(text) < 2 or len(text) > 300:
+        await message.answer('Текст должен быть от 2 до 300 символов.')
+        return
+    await state.update_data(reminder_text=text)
+    await AddReminder.next()
+    await message.answer('⏰ Теперь напиши время: <code>18:30</code>, <code>через 20 минут</code>, <code>через 2 часа</code>.', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=AddReminder.waiting_for_time)
+async def get_reminder_time(message: types.Message, state: FSMContext):
+    parsed = parse_reminder_time(message.text)
+    if not parsed:
+        await message.answer('⚠️ Не понял время. Пример: 18:30, через 20 минут, через 2 часа')
+        return
+    data = await state.get_data()
+    await create_reminder(message.from_user.id, data['reminder_text'], parsed.strftime('%Y-%m-%d %H:%M:%S'))
+    await state.finish()
+    await message.answer(f"✅ Напоминание сохранено\n\n⏰ {parsed.strftime('%d.%m %H:%M')}\n📝 {data['reminder_text']}", reply_markup=reminders_keyboard())
+
+
+# ---------- Здоровье ----------
+@dp.message_handler(commands=['norm'], state='*')
+@dp.message_handler(lambda message: message.text == '🧮 Рассчитать норму', state='*')
+async def health_setup_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    await HealthSetup.waiting_for_weight.set()
+    await message.answer('⚖️ Напиши вес в кг. Например: 89 или 89.5', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=HealthSetup.waiting_for_weight)
+async def health_setup_weight(message: types.Message, state: FSMContext):
+    try:
+        weight = float(message.text.replace(',', '.').strip())
+    except ValueError:
+        await message.answer('Введи вес числом. Например: 89.5')
+        return
+    if not 20 <= weight <= 300:
+        await message.answer('Введи реальный вес от 20 до 300 кг.')
+        return
+    await state.update_data(weight=weight)
+    await HealthSetup.next()
+    await message.answer('📏 Теперь рост в см. Например: 175', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=HealthSetup.waiting_for_height)
+async def health_setup_height(message: types.Message, state: FSMContext):
+    try:
+        height = int(message.text.strip())
+    except ValueError:
+        await message.answer('Введи рост числом. Например: 175')
+        return
+    if not 100 <= height <= 230:
+        await message.answer('Введи реальный рост от 100 до 230 см.')
+        return
+    await state.update_data(height=height)
+    await HealthSetup.next()
+    await message.answer('🏷 Какая форма? Напиши: худой, умеренный, есть лишний жир, спортивный.', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=HealthSetup.waiting_for_body_type)
+async def health_setup_body_type(message: types.Message, state: FSMContext):
+    body_type = normalize_body_type(message.text)
+    if not body_type:
+        await message.answer('Не понял форму. Напиши: худой / умеренный / есть лишний жир / спортивный.')
+        return
+    data = await state.get_data()
+    await update_health_profile(message.from_user.id, data['weight'], data['height'], body_type)
+    await state.finish()
+    user = await get_user(message.from_user.id)
+    await message.answer('✅ Готово. Вот твоя норма:', reply_markup=health_keyboard())
+    await message.answer(format_profile(user), reply_markup=health_keyboard())
+
+
+@dp.message_handler(commands=['weight'], state='*')
 @dp.message_handler(lambda message: message.text == '⚖️ Изменить вес', state='*')
 async def change_weight_start(message: types.Message, state: FSMContext):
     await state.finish()
@@ -137,9 +232,8 @@ async def change_weight_start(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=UpdateWeight.waiting_for_weight)
 async def change_weight_finish(message: types.Message, state: FSMContext):
-    raw = message.text.replace(',', '.').strip()
     try:
-        weight = float(raw)
+        weight = float(message.text.replace(',', '.').strip())
     except ValueError:
         await message.answer('⚠️ Введи вес числом. Например: 87 или 87.5')
         return
@@ -149,18 +243,21 @@ async def change_weight_finish(message: types.Message, state: FSMContext):
     await update_weight(message.from_user.id, weight)
     await state.finish()
     user = await get_user(message.from_user.id)
-    await message.answer('✅ Вес обновлён. Вот твой новый профиль:', reply_markup=health_keyboard())
+    await message.answer('✅ Вес обновлён.', reply_markup=health_keyboard())
     await message.answer(format_profile(user), reply_markup=health_keyboard())
 
 
+@dp.message_handler(commands=['water'], state='*')
 @dp.message_handler(lambda message: message.text == '💧 Выпил воду', state='*')
 async def drink_water(message: types.Message, state: FSMContext):
     await state.finish()
     await add_water(message.from_user.id, 250)
     user = await get_user(message.from_user.id)
-    await message.answer(f"💧 Записал +250 мл. Всего за сегодня: {user['water_ml']} мл", reply_markup=health_keyboard())
+    await message.answer(f"💧 Записал +250 мл. Всего сегодня: {user['water_ml']} мл", reply_markup=health_keyboard())
+    await _award(message)
 
 
+@dp.message_handler(commands=['resetwater'], state='*')
 @dp.message_handler(lambda message: message.text == '🔄 Сбросить воду', state='*')
 async def water_reset(message: types.Message, state: FSMContext):
     await state.finish()
@@ -168,6 +265,7 @@ async def water_reset(message: types.Message, state: FSMContext):
     await message.answer('💧 Счётчик воды сброшен.', reply_markup=health_keyboard())
 
 
+@dp.message_handler(commands=['steps'], state='*')
 @dp.message_handler(lambda message: message.text == '🚶 Добавить шаги', state='*')
 async def add_steps_start(message: types.Message, state: FSMContext):
     await state.finish()
@@ -191,95 +289,260 @@ async def add_steps_finish(message: types.Message, state: FSMContext):
     await message.answer(f"🚶 Добавил {steps} шагов. Теперь всего: {user['steps']}", reply_markup=health_keyboard())
 
 
-# Учёба
-@dp.message_handler(lambda message: message.text == '❓ Задать вопрос', state='*')
-async def study_question_start(message: types.Message, state: FSMContext):
+@dp.message_handler(commands=['mental'], state='*')
+@dp.message_handler(lambda message: message.text == '🧠 Ментальное', state='*')
+async def mental_start(message: types.Message, state: FSMContext):
     await state.finish()
-    await StudyAssistant.waiting_for_question.set()
+    await MentalChat.waiting_for_message.set()
+    await message.answer('🧠 Напиши, что чувствуешь. Я отвечу спокойно и поддерживающе.', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=MentalChat.waiting_for_message)
+async def mental_finish(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.answer(mental_support_answer(message.text), reply_markup=health_keyboard())
+
+
+@dp.message_handler(commands=['physical'], state='*')
+@dp.message_handler(lambda message: message.text == '🩺 Физическое', state='*')
+async def physical_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    await PhysicalHealth.waiting_for_symptoms.set()
+    await message.answer('🩺 Опиши симптомы: что болит, температура есть или нет, сколько длится.', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=PhysicalHealth.waiting_for_symptoms)
+async def physical_finish(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.answer(physical_health_answer(message.text), reply_markup=health_keyboard())
+
+
+@dp.message_handler(content_types=types.ContentType.LOCATION, state='*')
+async def nearest_pharmacies(message: types.Message, state: FSMContext):
+    await state.finish()
+    lat = message.location.latitude
+    lon = message.location.longitude
+    text = (
+        '📍 Я не имею встроенного доступа к базе аптек, но вот быстрые ссылки по твоей геопозиции:\n\n'
+        f'1. Google Maps: https://www.google.com/maps/search/pharmacy/@{lat},{lon},15z\n'
+        f'2. 2GIS: https://2gis.uz/search/аптека/geo/{lon},{lat}\n'
+        f'3. Яндекс Карты: https://yandex.com/maps/?text=аптека&ll={lon},{lat}&z=15\n\n'
+        'Открой любую ссылку — там будут ближайшие аптеки рядом.'
+    )
+    await message.answer(text, reply_markup=health_keyboard(), disable_web_page_preview=True)
+
+
+# ---------- День и цели ----------
+@dp.message_handler(commands=['plan'], state='*')
+@dp.message_handler(lambda message: message.text == '📅 План на сегодня', state='*')
+async def show_day_plan(message: types.Message, state: FSMContext):
+    await state.finish()
+    plans = await get_day_plans(message.from_user.id, today_str())
+    if not plans:
+        await message.answer('📅 План на сегодня пуст. Добавь пункт кнопкой “➕ Добавить план”.', reply_markup=day_keyboard())
+        return
+    lines = ['📅 <b>План на сегодня:</b>']
+    for i, row in enumerate(plans, 1):
+        lines.append(f'{i}. {row["text"]}')
+    await message.answer('\n'.join(lines), reply_markup=day_keyboard())
+
+
+@dp.message_handler(lambda message: message.text == '➕ Добавить план', state='*')
+async def add_plan_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    await AddDayPlan.waiting_for_text.set()
+    await message.answer('Напиши пункт плана на сегодня.', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=AddDayPlan.waiting_for_text)
+async def add_plan_finish(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if not 2 <= len(text) <= 200:
+        await message.answer('Пункт должен быть от 2 до 200 символов.')
+        return
+    await add_day_plan(message.from_user.id, text, today_str())
+    await state.finish()
+    await message.answer('✅ Добавил в план на сегодня.', reply_markup=day_keyboard())
+
+
+@dp.message_handler(lambda message: message.text == '🗑 Очистить план', state='*')
+async def clear_plan(message: types.Message, state: FSMContext):
+    await state.finish()
+    await clear_day_plan(message.from_user.id)
+    await message.answer('🗑 План на сегодня очищен.', reply_markup=day_keyboard())
+
+
+@dp.message_handler(commands=['goals'], state='*')
+@dp.message_handler(lambda message: message.text == '🎯 Цели', state='*')
+async def show_goals(message: types.Message, state: FSMContext):
+    await state.finish()
+    goals = await get_goals(message.from_user.id)
+    if not goals:
+        await message.answer('🎯 Целей пока нет. Добавь первую цель.', reply_markup=day_keyboard())
+        return
+    lines = ['🎯 <b>Твои цели:</b>']
+    for row in goals:
+        lines.append(f'{row["id"]}. {row["text"]}')
+    await message.answer('\n'.join(lines), reply_markup=day_keyboard())
+
+
+@dp.message_handler(lambda message: message.text == '➕ Добавить цель', state='*')
+async def add_goal_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    await AddGoal.waiting_for_text.set()
+    await message.answer('Напиши цель. Она будет храниться, пока ты её не удалишь.', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=AddGoal.waiting_for_text)
+async def add_goal_finish(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if not 2 <= len(text) <= 200:
+        await message.answer('Цель должна быть от 2 до 200 символов.')
+        return
+    await add_goal(message.from_user.id, text)
+    await state.finish()
+    await message.answer('✅ Цель добавлена.', reply_markup=day_keyboard())
+
+
+@dp.message_handler(lambda message: message.text == '➖ Убрать цель', state='*')
+async def remove_goal_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    goals = await get_goals(message.from_user.id)
+    if not goals:
+        await message.answer('У тебя пока нет целей.', reply_markup=day_keyboard())
+        return
+    lines = ['Напиши номер цели, которую удалить:']
+    for row in goals:
+        lines.append(f'{row["id"]}. {row["text"]}')
+    await RemoveGoal.waiting_for_id.set()
+    await message.answer('\n'.join(lines), reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=RemoveGoal.waiting_for_id)
+async def remove_goal_finish(message: types.Message, state: FSMContext):
+    try:
+        goal_id = int(message.text.strip())
+    except ValueError:
+        await message.answer('Введи номер цели числом.')
+        return
+    ok = await remove_goal(message.from_user.id, goal_id)
+    await state.finish()
+    await message.answer('✅ Цель удалена.' if ok else 'Не нашёл цель с таким номером.', reply_markup=day_keyboard())
+
+
+@dp.message_handler(commands=['pulse'], state='*')
+@dp.message_handler(lambda message: message.text == '💓 Пульс дня', state='*')
+async def pulse_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    await DailyPulse.waiting_for_energy.set()
+    await message.answer('💓 Оцени энергию от 1 до 10.', reply_markup=cancel_keyboard())
+
+
+async def _get_score(message: types.Message):
+    try:
+        value = int(message.text.strip())
+    except ValueError:
+        return None
+    return value if 1 <= value <= 10 else None
+
+
+@dp.message_handler(state=DailyPulse.waiting_for_energy)
+async def pulse_energy(message: types.Message, state: FSMContext):
+    value = await _get_score(message)
+    if value is None:
+        await message.answer('Введи число от 1 до 10.')
+        return
+    await state.update_data(energy=value)
+    await DailyPulse.next()
+    await message.answer('🙂 Настроение от 1 до 10?', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=DailyPulse.waiting_for_mood)
+async def pulse_mood(message: types.Message, state: FSMContext):
+    value = await _get_score(message)
+    if value is None:
+        await message.answer('Введи число от 1 до 10.')
+        return
+    await state.update_data(mood=value)
+    await DailyPulse.next()
+    await message.answer('😴 Сон от 1 до 10?', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=DailyPulse.waiting_for_sleep)
+async def pulse_sleep(message: types.Message, state: FSMContext):
+    value = await _get_score(message)
+    if value is None:
+        await message.answer('Введи число от 1 до 10.')
+        return
+    data = await state.get_data()
+    await save_daily_pulse(message.from_user.id, today_str(), data['energy'], data['mood'], value)
+    await state.finish()
+    await message.answer(daily_pulse_answer(data['energy'], data['mood'], value), reply_markup=day_keyboard())
+
+
+# ---------- Учёба ----------
+@dp.message_handler(commands=['explain'], state='*')
+@dp.message_handler(lambda message: message.text == '📖 Объяснить тему', state='*')
+async def explain_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    await StudyExplain.waiting_for_topic.set()
+    await message.answer('📖 Напиши тему. Например: линейные уравнения, многочлены, графики функций.', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=StudyExplain.waiting_for_topic)
+async def explain_finish(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.answer(study_explain(message.text.strip()), reply_markup=study_keyboard())
+
+
+@dp.message_handler(commands=['timer'], state='*')
+@dp.message_handler(lambda message: message.text == '⏱ Решить на время', state='*')
+async def timer_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    await StudyTimer.waiting_for_topic.set()
+    await message.answer('⏱ Напиши тему для задач.', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=StudyTimer.waiting_for_topic)
+async def timer_topic(message: types.Message, state: FSMContext):
+    topic = message.text.strip()
+    if len(topic) < 2:
+        await message.answer('Напиши тему подробнее.')
+        return
+    await state.update_data(topic=topic)
+    await StudyTimer.next()
+    await message.answer('На сколько минут поставить таймер? Например: 10', reply_markup=cancel_keyboard())
+
+
+@dp.message_handler(state=StudyTimer.waiting_for_minutes)
+async def timer_minutes(message: types.Message, state: FSMContext):
+    try:
+        minutes = int(message.text.strip())
+    except ValueError:
+        await message.answer('Введи минуты числом.')
+        return
+    if not 1 <= minutes <= 180:
+        await message.answer('Поставь от 1 до 180 минут.')
+        return
+    data = await state.get_data()
+    tasks = generate_tasks(data['topic'])
+    finish_at = local_now() + timedelta(minutes=minutes)
+    await create_reminder(message.from_user.id, f'Время вышло по теме: {data["topic"]}', finish_at.strftime('%Y-%m-%d %H:%M:%S'))
+    await state.finish()
     await message.answer(
-        'Напиши вопрос по учёбе.\n\n'
-        'Сейчас в шаблоне стоит простая заготовка ответа. Позже сюда можно подключить OpenAI.',
-        reply_markup=cancel_keyboard(),
+        f"⏱ Таймер на {minutes} мин запущен.\n\n<b>Задачи:</b>\n" + '\n'.join(f'{i}. {task}' for i, task in enumerate(tasks, 1)),
+        reply_markup=study_keyboard()
     )
 
 
-@dp.message_handler(state=StudyAssistant.waiting_for_question)
-async def study_question_finish(message: types.Message, state: FSMContext):
-    question = message.text.strip()
+# ---------- Статусы ----------
+@dp.message_handler(commands=['shop'], state='*')
+async def status_shop(message: types.Message, state: FSMContext):
     await state.finish()
-    answer = (
-        f"📚 <b>Твой вопрос:</b> {question}\n\n"
-        "<b>Baymax советует:</b>\n"
-        "1. Разбей задачу на маленькие части.\n"
-        "2. Выпиши главное правило или формулу.\n"
-        "3. Реши 1 простой пример.\n"
-        "4. Потом переходи к сложному.\n\n"
-        "Если хочешь, я могу дальше переделать этот раздел и подключить сюда ИИ-ответы через OpenAI API."
-    )
-    await message.answer(answer, reply_markup=study_keyboard())
-
-
-@dp.message_handler(lambda message: message.text == '📝 План на день', state='*')
-async def study_plan(message: types.Message, state: FSMContext):
-    await state.finish()
-    text = (
-        "📝 <b>Пример плана на день</b>\n\n"
-        "1. 45 минут — учёба\n"
-        "2. 10 минут — перерыв\n"
-        "3. 45 минут — домашка\n"
-        "4. 20 минут — повторение\n"
-        "5. 30 минут — отдых\n\n"
-        "Совет: сначала сделай самый трудный предмет."
-    )
-    await message.answer(text, reply_markup=study_keyboard())
-
-
-# Поддержка
-@dp.message_handler(lambda message: message.text == '😊 Нормально', state='*')
-async def mood_ok(message: types.Message, state: FSMContext):
-    await state.finish()
-    await message.answer('Отлично 💙 Продолжай в своём темпе. Не забывай про воду, отдых и сон.', reply_markup=support_keyboard())
-
-
-@dp.message_handler(lambda message: message.text == '😔 Грустно', state='*')
-async def mood_sad(message: types.Message, state: FSMContext):
-    await state.finish()
-    text = (
-        'Мне жаль, что тебе грустно 💙\n\n'
-        'Попробуй:\n'
-        '• немного пройтись\n'
-        '• выпить воды\n'
-        '• написать близкому человеку\n'
-        '• сделать 3 медленных вдоха и выдоха\n\n'
-        'Если хочешь, напиши кому из близких ты можешь сейчас написать.'
-    )
-    await message.answer(text, reply_markup=support_keyboard())
-
-
-@dp.message_handler(lambda message: message.text == '😣 Тревожно', state='*')
-async def mood_anxious(message: types.Message, state: FSMContext):
-    await state.finish()
-    text = (
-        'Давай немного успокоимся 💙\n\n'
-        'Сделай упражнение 4–4–4:\n'
-        '1. Вдох 4 секунды\n'
-        '2. Задержка 4 секунды\n'
-        '3. Выдох 4 секунды\n'
-        'Повтори 4 раза.\n\n'
-        'Если тревога не проходит, обязательно обратись к взрослому, которому доверяешь.'
-    )
-    await message.answer(text, reply_markup=support_keyboard())
-
-
-@dp.message_handler(lambda message: message.text == '🆘 Нужна помощь', state='*')
-async def urgent_help(message: types.Message, state: FSMContext):
-    await state.finish()
-    text = (
-        'Если тебе <b>небезопасно</b> или очень тяжело, пожалуйста, сразу обратись к:\n'
-        '• родителю\n'
-        '• родственнику\n'
-        '• школьному психологу\n'
-        '• учителю\n\n'
-        'Если есть риск для жизни или здоровья — звони в экстренные службы своей страны <b>прямо сейчас</b>.'
-    )
-    await message.answer(text, reply_markup=support_keyboard())
+    user = await get_user(message.from_user.id)
+    candies = user['candies'] or 0
+    lines = [f'🍭 У тебя леденцов: {candies}\n', '<b>Магазин статусов:</b>']
+    for price, name in STATUS_SHOP.items():
+        mark = '✅ доступно' if candies >= price else f'нужно {price}'
+        lines.append(f'• {name} — {price} 🍭 ({mark})')
+    await message.answer('\n'.join(lines), reply_markup=main_menu_keyboard())
