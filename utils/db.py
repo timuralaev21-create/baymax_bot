@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, date
 
 from data import config
 
@@ -12,11 +12,15 @@ def _connect():
     return conn
 
 
+def _column_exists(cur, table: str, column: str) -> bool:
+    cur.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in cur.fetchall())
+
+
 async def init_db():
     conn = _connect()
     cur = conn.cursor()
-    cur.execute(
-        '''
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             full_name TEXT,
@@ -26,10 +30,21 @@ async def init_db():
             steps INTEGER DEFAULT 0,
             created_at TEXT
         )
-        '''
-    )
-    cur.execute(
-        '''
+    ''')
+
+    migrations = {
+        'body_type': "TEXT DEFAULT 'moderate'",
+        'candies': 'INTEGER DEFAULT 0',
+        'last_candy_date': 'TEXT',
+        'last_plan_date': 'TEXT',
+        'last_pulse_date': 'TEXT',
+        'timezone_offset': 'INTEGER DEFAULT 5'
+    }
+    for column, definition in migrations.items():
+        if not _column_exists(cur, 'users', column):
+            cur.execute(f'ALTER TABLE users ADD COLUMN {column} {definition}')
+
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS reminders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -37,8 +52,36 @@ async def init_db():
             remind_at TEXT NOT NULL,
             sent INTEGER DEFAULT 0
         )
-        '''
-    )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS day_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            plan_date TEXT NOT NULL,
+            done INTEGER DEFAULT 0,
+            created_at TEXT
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS daily_pulses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            pulse_date TEXT NOT NULL,
+            energy INTEGER NOT NULL,
+            mood INTEGER NOT NULL,
+            sleep INTEGER NOT NULL,
+            created_at TEXT
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -51,19 +94,16 @@ async def create_or_update_user(user_id: int, full_name: str):
     if exists:
         cur.execute('UPDATE users SET full_name = ? WHERE user_id = ?', (full_name, user_id))
     else:
-        cur.execute(
-            '''
+        cur.execute('''
             INSERT INTO users (user_id, full_name, height, weight, water_ml, steps, created_at)
             VALUES (?, ?, ?, ?, 0, 0, ?)
-            ''',
-            (
-                user_id,
-                full_name,
-                config.DEFAULT_HEIGHT,
-                config.DEFAULT_WEIGHT,
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            )
-        )
+        ''', (
+            user_id,
+            full_name,
+            config.DEFAULT_HEIGHT,
+            config.DEFAULT_WEIGHT,
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        ))
     conn.commit()
     conn.close()
 
@@ -75,6 +115,23 @@ async def get_user(user_id: int):
     row = cur.fetchone()
     conn.close()
     return row
+
+
+async def get_all_users():
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM users ORDER BY created_at DESC')
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+async def update_health_profile(user_id: int, weight: float, height: int, body_type: str):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('UPDATE users SET weight = ?, height = ?, body_type = ? WHERE user_id = ?', (weight, height, body_type, user_id))
+    conn.commit()
+    conn.close()
 
 
 async def update_weight(user_id: int, weight: float):
@@ -109,13 +166,24 @@ async def add_steps(user_id: int, steps: int):
     conn.close()
 
 
+async def award_daily_candy(user_id: int, today: str):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('SELECT last_candy_date FROM users WHERE user_id = ?', (user_id,))
+    row = cur.fetchone()
+    if row and row['last_candy_date'] == today:
+        conn.close()
+        return False
+    cur.execute('UPDATE users SET candies = candies + 1, last_candy_date = ? WHERE user_id = ?', (today, user_id))
+    conn.commit()
+    conn.close()
+    return True
+
+
 async def create_reminder(user_id: int, text: str, remind_at: str):
     conn = _connect()
     cur = conn.cursor()
-    cur.execute(
-        'INSERT INTO reminders (user_id, text, remind_at, sent) VALUES (?, ?, ?, 0)',
-        (user_id, text, remind_at)
-    )
+    cur.execute('INSERT INTO reminders (user_id, text, remind_at, sent) VALUES (?, ?, ?, 0)', (user_id, text, remind_at))
     conn.commit()
     conn.close()
 
@@ -124,10 +192,7 @@ async def get_user_reminders(user_id: int, only_active: bool = True):
     conn = _connect()
     cur = conn.cursor()
     if only_active:
-        cur.execute(
-            'SELECT * FROM reminders WHERE user_id = ? AND sent = 0 ORDER BY remind_at ASC',
-            (user_id,)
-        )
+        cur.execute('SELECT * FROM reminders WHERE user_id = ? AND sent = 0 ORDER BY remind_at ASC', (user_id,))
     else:
         cur.execute('SELECT * FROM reminders WHERE user_id = ? ORDER BY remind_at DESC', (user_id,))
     rows = cur.fetchall()
@@ -138,10 +203,7 @@ async def get_user_reminders(user_id: int, only_active: bool = True):
 async def get_due_reminders(now_str: str):
     conn = _connect()
     cur = conn.cursor()
-    cur.execute(
-        'SELECT * FROM reminders WHERE sent = 0 AND remind_at <= ? ORDER BY remind_at ASC',
-        (now_str,)
-    )
+    cur.execute('SELECT * FROM reminders WHERE sent = 0 AND remind_at <= ? ORDER BY remind_at ASC', (now_str,))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -151,5 +213,99 @@ async def mark_reminder_sent(reminder_id: int):
     conn = _connect()
     cur = conn.cursor()
     cur.execute('UPDATE reminders SET sent = 1 WHERE id = ?', (reminder_id,))
+    conn.commit()
+    conn.close()
+
+
+async def reset_old_day_plan(user_id: int, today: str):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('SELECT last_plan_date FROM users WHERE user_id = ?', (user_id,))
+    row = cur.fetchone()
+    if row and row['last_plan_date'] != today:
+        cur.execute('DELETE FROM day_plans WHERE user_id = ?', (user_id,))
+        cur.execute('UPDATE users SET last_plan_date = ? WHERE user_id = ?', (today, user_id))
+    elif row and not row['last_plan_date']:
+        cur.execute('UPDATE users SET last_plan_date = ? WHERE user_id = ?', (today, user_id))
+    conn.commit()
+    conn.close()
+
+
+async def add_day_plan(user_id: int, text: str, today: str):
+    await reset_old_day_plan(user_id, today)
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('INSERT INTO day_plans (user_id, text, plan_date, created_at) VALUES (?, ?, ?, ?)', (user_id, text, today, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    conn.commit()
+    conn.close()
+
+
+async def get_day_plans(user_id: int, today: str):
+    await reset_old_day_plan(user_id, today)
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM day_plans WHERE user_id = ? ORDER BY id ASC', (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+async def clear_day_plan(user_id: int):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('DELETE FROM day_plans WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+
+async def add_goal(user_id: int, text: str):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('INSERT INTO goals (user_id, text, created_at) VALUES (?, ?, ?)', (user_id, text, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    conn.commit()
+    conn.close()
+
+
+async def get_goals(user_id: int):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM goals WHERE user_id = ? ORDER BY id ASC', (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+async def remove_goal(user_id: int, goal_id: int) -> bool:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('DELETE FROM goals WHERE user_id = ? AND id = ?', (user_id, goal_id))
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+async def save_daily_pulse(user_id: int, today: str, energy: int, mood: int, sleep: int):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('INSERT INTO daily_pulses (user_id, pulse_date, energy, mood, sleep, created_at) VALUES (?, ?, ?, ?, ?, ?)', (user_id, today, energy, mood, sleep, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    cur.execute('UPDATE users SET last_pulse_date = ? WHERE user_id = ?', (today, user_id))
+    conn.commit()
+    conn.close()
+
+
+async def users_for_morning_pulse(today: str):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM users WHERE last_pulse_date IS NULL OR last_pulse_date != ?', (today,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+async def mark_pulse_asked(user_id: int, today: str):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute('UPDATE users SET last_pulse_date = ? WHERE user_id = ?', (today, user_id))
     conn.commit()
     conn.close()
